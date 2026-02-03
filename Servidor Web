@@ -1,0 +1,371 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Tracking GPS en Tiempo Real</title>
+
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <style>
+    body{font-family:Arial,sans-serif;margin:0;font-size:12px}
+
+    #top{position:fixed;top:0;left:0;right:0;z-index:1000;padding:5px 8px;background:rgba(255,255,255,0);pointer-events:none}
+    #top .row,#top button,#top .box,#top .title-box{pointer-events:auto}
+
+    .row{display:flex;gap:6px;flex-wrap:wrap;margin-top:5px;align-items:center}
+
+    .box,.title-box{padding:3px 6px;border:1px solid rgba(221,221,221,.85);border-radius:8px;font-size:11px;background:rgba(255,255,255,.55);backdrop-filter:blur(2px)}
+    .title-box{display:inline-block;font-size:11px;line-height:1.15;max-width:100%;white-space:normal;overflow-wrap:anywhere;word-break:break-word;text-shadow:0 1px 2px rgba(255,255,255,.85)}
+
+    html,body,#map{height:100%;width:100%}
+    #map{position:fixed;inset:0}
+
+    .bus-wrap{width:30px;height:30px;border-radius:999px;display:flex;align-items:center;justify-content:center;transform:translate(-50%,-50%);border:2px solid rgba(255,255,255,.9);user-select:none}
+    .bus-wrap.moving{background:#008000}
+    .bus-wrap.stopped{background:#ff0000}
+    .bus-emoji{font-size:18px;line-height:1}
+
+    .stop-icon{font-size:30px;transform:translate(-50%,-50%)}
+
+    .btn-refresh{padding:3px 6px;border:1px solid #bbb;background:rgba(255,255,255,.85);border-radius:8px;font-size:11px;cursor:pointer;user-select:none}
+    .btn-refresh:active{transform:scale(.98)}
+
+    .popup-wrap{width:160px}
+    .popup-title{display:block;color:#000;font-weight:700;margin:0 0 4px 2px;font-size:12px;line-height:1}
+    .speed-pill{display:inline-block;padding:6px 10px;border-radius:999px;color:#fff;font-weight:700;font-size:13px;margin:2px 0}
+    .speed-pill.moving{background:#1db954}
+    .speed-pill.stopped{background:#ff0000}
+
+    .state-pill{display:inline-block;padding:6px 10px;border-radius:999px;color:#fff;font-weight:700;font-size:13px;margin:6px 0 0 0}
+    .state-pill.moving{background:#008000}
+    .state-pill.stopped{background:#ff0000}
+
+    .busstate-pill{display:inline-block;padding:3px 6px;border-radius:8px;color:#fff;font-weight:700;font-size:11px}
+    .busstate-pill.moving{background:#008000}
+    .busstate-pill.stopped{background:#ff0000}
+  </style>
+</head>
+
+<body>
+  <div id="top">
+    <div class="title-box">🚍 TerminalOtavalo-Centro-SanJuanAlto-LaBanda-Quichinche</div>
+
+    <div class="row">
+      <div class="box">Hora: <b id="hora">--</b></div>
+      <div class="box">Estado: <span id="busState" class="busstate-pill stopped">Detenido</span></div>
+
+      <button id="btnReload" class="btn-refresh">🔃 Recargar</button>
+      <button id="btnToggleTrail" class="btn-refresh">🟢 Ruta: Si</button>
+    </div>
+  </div>
+
+  <div id="map"></div>
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.4/firebase-app.js";
+import { getDatabase, ref, onValue } from "https://www.gstatic.com/firebasejs/10.12.4/firebase-database.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyB1PlndJO4Ntcx-1kBF0_9civhqmw6RW6o",
+  authDomain: "gpsdb-f5976.firebaseapp.com",
+  databaseURL: "https://gpsdb-f5976-default-rtdb.firebaseio.com",
+  projectId: "gpsdb-f5976"
+};
+
+const app = initializeApp(firebaseConfig);
+const db = getDatabase(app);
+
+// ---------------- MAPA (✅ sin botones zoom) ----------------
+const map = L.map('map', { zoomControl:false }).setView([0,0], 2);
+map.attributionControl.setPrefix('RedOtavalo');
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+
+/* ✅ AUTO-CIERRE GLOBAL (menos código): cualquier popup se cierra a los 10s */
+map.on("popupopen", (e)=>{
+  setTimeout(()=>{ if(map.hasLayer(e.popup)) map.closePopup(e.popup); }, 10000);
+});
+
+const stopIcon = L.divIcon({ className:'stop-icon', html:'🚏', iconSize:[42,42], iconAnchor:[21,21] });
+
+function makeBusIconHtml(moving){
+  return `<div class="bus-wrap ${moving?"moving":"stopped"}"><span class="bus-emoji">🚍</span></div>`;
+}
+let busIsMoving = false;
+let busIcon = L.divIcon({ className:'', html: makeBusIconHtml(false), iconSize:[30,30], iconAnchor:[15,15] });
+const busMarker = L.marker([0,0], {icon:busIcon}).addTo(map);
+
+function buildBusPopupHtml(speedKmh, isMoving){
+  const estadoTxt = isMoving ? "Movimiento" : "Detenido";
+  return `<div class="popup-wrap">
+    <span class="popup-title">Nodo Móvil</span>
+    <span class="speed-pill ${isMoving?"moving":"stopped"}">Velocidad: ${Number(speedKmh||0).toFixed(1)} km/h</span>
+    <span class="state-pill ${isMoving?"moving":"stopped"}">Estado: ${estadoTxt}</span>
+  </div>`;
+}
+busMarker.bindPopup(buildBusPopupHtml(0,false));
+busMarker.on("popupopen", ()=> pauseFollowFor());
+
+// ---------------- AUTO-FOLLOW (pausa 15s por zoom/mover) ----------------
+const FOLLOW_RESUME_MS = 15000;
+let followEnabled = true, followTimer = null, lastLatLng = null;
+
+function pauseFollowFor(ms = FOLLOW_RESUME_MS){
+  followEnabled = false;
+  if (followTimer) clearTimeout(followTimer);
+  followTimer = setTimeout(() => {
+    followEnabled = true;
+    if (lastLatLng) map.setView(lastLatLng, map.getZoom(), { animate:true, duration:0.6 });
+  }, ms);
+}
+map.on("zoomstart", () => pauseFollowFor());
+map.on("zoom",      () => pauseFollowFor());
+map.on("dragstart", () => pauseFollowFor());
+map.on("movestart", () => pauseFollowFor());
+
+// ---------------- BOTÓN: RECARGAR ----------------
+document.getElementById("btnReload").addEventListener("click", () => location.reload());
+
+// ---------------- RECORRIDO (PERSISTENTE) ----------------
+const trailLatLngs = [];
+const MAX_POINTS = 2500;
+const trailLine = L.polyline(trailLatLngs, { color:"green", weight:6, opacity:0.9 }).addTo(map);
+let trailVisible = true;
+
+document.getElementById("btnToggleTrail").addEventListener("click", (e) => {
+  trailVisible = !trailVisible;
+  if(trailVisible){
+    trailLine.setLatLngs(trailLatLngs);
+    if(!map.hasLayer(trailLine)) trailLine.addTo(map);
+    e.target.textContent = "🟢 Ruta: Si";
+  }else{
+    if(map.hasLayer(trailLine)) map.removeLayer(trailLine);
+    e.target.textContent = "⚫ Ruta: No";
+  }
+});
+
+// ---------------- UTIL ----------------
+function haversineMeters(lat1, lon1, lat2, lon2){
+  const R=6371000, toRad=x=>x*Math.PI/180;
+  const dLat=toRad(lat2-lat1), dLon=toRad(lon2-lon1);
+  const a=Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+  return 2*R*Math.asin(Math.sqrt(a));
+}
+function formatDist(m){
+  if(!isFinite(m) || m<=0) return "--";
+  return (m < 1000) ? `${m.toFixed(0)} m` : `${(m/1000).toFixed(2)} km`;
+}
+function formatETA(sec){
+  if(!isFinite(sec)||sec<=0) return "--";
+  const m=Math.round(sec/60);
+  if(m<1) return "< 1 min";
+  if(m<60) return `${m} min`;
+  return `${Math.floor(m/60)} h ${m%60} min`;
+}
+const ema=(p,x,a)=>(p==null)?x:(a*x+(1-a)*p);
+const ema2=(p,x,a)=>!p?x:[ema(p[0],x[0],a),ema(p[1],x[1],a)];
+
+// ---------------- ETA REALISTA ----------------
+const ROUTE_FACTOR=1.45, ETA_BIAS_SEC=45, DEFAULT_SPEED_KMH=4.0;
+const SPEED_ALPHA=0.35, MIN_USABLE_SPEED_KMH=3.0, MAX_REASONABLE_SPEED_KMH=55;
+
+let speedSmoothed=null, lastGoodSpeed=null;
+
+function pickSpeedKmh(rawSpeedKmh){
+  let s = Number(rawSpeedKmh || 0);
+  if (!isFinite(s) || s < 0) s = 0;
+  if (s > MAX_REASONABLE_SPEED_KMH) s = MAX_REASONABLE_SPEED_KMH;
+
+  speedSmoothed = ema(speedSmoothed, s, SPEED_ALPHA);
+  if (isFinite(speedSmoothed) && speedSmoothed >= MIN_USABLE_SPEED_KMH) lastGoodSpeed = speedSmoothed;
+
+  if (isFinite(speedSmoothed) && speedSmoothed >= MIN_USABLE_SPEED_KMH) return speedSmoothed;
+  if (isFinite(lastGoodSpeed) && lastGoodSpeed >= MIN_USABLE_SPEED_KMH) return lastGoodSpeed;
+  return DEFAULT_SPEED_KMH;
+}
+function calcEtaSeconds(distStraightM, usedSpeedKmh){
+  const distRoadM = distStraightM * ROUTE_FACTOR;
+  const speedMs = usedSpeedKmh / 3.6;
+  return (distRoadM / Math.max(speedMs, 0.1)) + ETA_BIAS_SEC;
+}
+
+// ---------------- RUTA VERDE (FORZADA) - SIN OSRM ----------------
+const SMOOTH_ALPHA_POS=0.45, MIN_ADD_DIST_M=3, MAX_JUMP_DRAW_M=200;
+let lastStableDraw=null, lastSmoothed=null;
+
+function pushTrail(latLng){
+  trailLatLngs.push(latLng);
+  if (trailLatLngs.length > MAX_POINTS) trailLatLngs.shift();
+  if(trailVisible) trailLine.setLatLngs(trailLatLngs);
+}
+function chooseStablePoint(lat, lon){
+  const p = [lat, lon];
+  if(!lastStableDraw){ lastStableDraw = p; return { point:p, usedFallback:false }; }
+  const jumpM = haversineMeters(lastStableDraw[0], lastStableDraw[1], p[0], p[1]);
+  if (jumpM > MAX_JUMP_DRAW_M) return { point:lastStableDraw, usedFallback:true };
+  lastStableDraw = p;
+  return { point:p, usedFallback:false };
+}
+function updateGreenTrailForced(rawLat, rawLon){
+  const chosen = chooseStablePoint(rawLat, rawLon);
+  lastSmoothed = ema2(lastSmoothed, chosen.point, SMOOTH_ALPHA_POS);
+  const p = lastSmoothed;
+  if(trailLatLngs.length === 0) pushTrail(p);
+  else{
+    const last = trailLatLngs[trailLatLngs.length - 1];
+    if(haversineMeters(last[0], last[1], p[0], p[1]) >= MIN_ADD_DIST_M) pushTrail(p);
+  }
+}
+
+// ---------------- PARADAS ----------------
+const stops = [
+  { id:'p1',  name:'Parada 1',  lat:0.237746, lon:-78.288787 },
+  { id:'p2',  name:'Parada 2',  lat:0.237163, lon:-78.289931 },
+  { id:'p3',  name:'Parada 3',  lat:0.236436, lon:-78.291429 },
+  { id:'p4',  name:'Parada 4',  lat:0.235681, lon:-78.292848 },
+  { id:'p5',  name:'Parada 5',  lat:0.235104, lon:-78.291241 },
+  { id:'p6',  name:'Parada 6',  lat:0.235786, lon:-78.290140 },
+  { id:'p7',  name:'Parada 7',  lat:0.236424, lon:-78.288876 },
+  { id:'p8',  name:'Parada 8',  lat:0.236883, lon:-78.287719 },
+  { id:'p9',  name:'Parada 9',  lat:0.237852, lon:-78.288037 },
+  { id:'p10', name:'Parada 10', lat:0.238660, lon:-78.286751 },
+  { id:'p11', name:'Parada 11', lat:0.239912, lon:-78.284246 },
+  { id:'p16', name:'Parada 16', lat:0.233919, lon:-78.269057 },
+  { id:'p17', name:'Parada 17', lat:0.232860, lon:-78.268092 },
+  { id:'p18', name:'Parada 18', lat:0.231621, lon:-78.266599 },
+  { id:'p19', name:'Parada 19', lat:0.230428, lon:-78.264489 },
+  { id:'p20', name:'Parada 20', lat:0.232345, lon:-78.263145 },
+  { id:'p21', name:'Parada 21', lat:0.231442, lon:-78.261943 },
+  { id:'p22', name:'Parada 22', lat:0.229405, lon:-78.259257 },
+  { id:'p23', name:'Parada 23', lat:0.230843, lon:-78.257985 }
+];
+
+const stopMarkers = new Map();
+let activeStopId = null;
+
+const STOP_POPUP_BASE = (name)=>(
+  `<b>🚏 ${name}</b><br>Llegada Bus: <b>--</b><br>Distancia Bus: <b>--</b><br>Velocidad Bus: <b>--</b>`
+);
+
+stops.forEach(s => {
+  const m = L.marker([s.lat, s.lon], {icon:stopIcon}).addTo(map);
+  m.bindPopup(STOP_POPUP_BASE(s.name));
+  m.on("popupopen", ()=>{ activeStopId = s.id; pauseFollowFor(); });
+  m.on("popupclose", ()=>{ if(activeStopId===s.id) activeStopId=null; });
+  stopMarkers.set(s.id, m);
+});
+
+// ---------------- NodoFijo ----------------
+const NODO_FIJO_ID = "NodoFijo";
+let nodoFijoMarker = null;
+let nodoFijoLast = { dist_m:null, eta_s:null };
+
+function buildNodoFijoPopupHtml(speedKmh){
+  const distTxt = (isFinite(nodoFijoLast.dist_m) && nodoFijoLast.dist_m >= 0) ? formatDist(nodoFijoLast.dist_m) : "--";
+  const etaTxt  = (isFinite(nodoFijoLast.eta_s)  && nodoFijoLast.eta_s  >  0) ? formatETA(nodoFijoLast.eta_s) : "--";
+  return `<b>🚏 NodoFijo</b><br>Llegada Bus: <b>${etaTxt}</b><br>Distancia Bus: <b>${distTxt}</b><br>Velocidad Bus: <b>${Number(speedKmh||0).toFixed(1)} km/h</b>`;
+}
+
+function upsertNodoFijoMarker(lat, lon){
+  if(!nodoFijoMarker){
+    nodoFijoMarker = L.marker([lat, lon], { icon: stopIcon }).addTo(map);
+    nodoFijoMarker.bindPopup(buildNodoFijoPopupHtml(0));
+    nodoFijoMarker.on("popupopen", ()=>{ activeStopId = NODO_FIJO_ID; pauseFollowFor(); });
+    nodoFijoMarker.on("popupclose", ()=>{ if(activeStopId===NODO_FIJO_ID) activeStopId = null; });
+    stopMarkers.set(NODO_FIJO_ID, nodoFijoMarker);
+  }else nodoFijoMarker.setLatLng([lat, lon]);
+}
+
+// ---------------- BUS ICON STATE ----------------
+function setBusMovingState(isMoving){
+  if(busIsMoving === isMoving) return;
+  busIsMoving = isMoving;
+  busIcon = L.divIcon({ className:'', html: makeBusIconHtml(busIsMoving), iconSize:[30,30], iconAnchor:[15,15] });
+  busMarker.setIcon(busIcon);
+
+  const el = document.getElementById("busState");
+  if(el){
+    el.classList.toggle("moving", isMoving);
+    el.classList.toggle("stopped", !isMoving);
+    el.textContent = isMoving ? "Movimiento" : "Detenido";
+  }
+}
+
+// ---------------- FIREBASE ----------------
+const gpsRef = ref(db, "NodoMovil");
+const nfRef  = ref(db, "NodoFijo");
+
+onValue(nfRef, (snap)=>{
+  const d = snap.val();
+  if(!d) return;
+  const lat = Number(d.lat || 0), lon = Number(d.lon || 0);
+  if(!lat || !lon) return;
+
+  nodoFijoLast.dist_m = (d.bus_dist_m !== undefined) ? Number(d.bus_dist_m) : null;
+  nodoFijoLast.eta_s  = (d.bus_eta_s  !== undefined) ? Number(d.bus_eta_s)  : null;
+
+  upsertNodoFijoMarker(lat, lon);
+});
+
+const FORCE_DRAW_MS = 3000;
+let latestBusData = null;
+
+onValue(gpsRef, (snap)=>{ const d = snap.val(); if(d) latestBusData = d; });
+
+function applyBusDataToUIAndMap(d){
+  const lat = Number(d.lat || 0), lon = Number(d.lon || 0);
+  if(!lat || !lon) return null;
+
+  const rawSpeedKmh = Number(d.speed_kmh || 0);
+  const usedSpeedKmh = pickSpeedKmh(rawSpeedKmh);
+
+  document.getElementById("hora").textContent = d.hora_ecuador ?? "--";
+  setBusMovingState(rawSpeedKmh >= 2.8);
+
+  const busPos=[lat,lon];
+  busMarker.setLatLng(busPos);
+
+  if (followEnabled) map.panTo(busPos,{animate:true,duration:0.4});
+  if(!lastLatLng) map.setView(busPos,16);
+  lastLatLng=busPos;
+
+  const popupHtml = buildBusPopupHtml(rawSpeedKmh, busIsMoving);
+  if(busMarker.getPopup()) busMarker.setPopupContent(popupHtml);
+  else busMarker.bindPopup(popupHtml);
+
+  return { lat, lon, rawSpeedKmh, usedSpeedKmh };
+}
+
+setInterval(()=>{
+  if(!latestBusData) return;
+
+  const info = applyBusDataToUIAndMap(latestBusData);
+  if(!info) return;
+
+  updateGreenTrailForced(info.lat, info.lon);
+
+  if(activeStopId){
+    if(activeStopId === NODO_FIJO_ID && nodoFijoMarker){
+      nodoFijoMarker.setPopupContent(buildNodoFijoPopupHtml(info.usedSpeedKmh));
+    }else{
+      const s = stops.find(x=>x.id===activeStopId);
+      const m = stopMarkers.get(activeStopId);
+      if(s && m){
+        const dist2 = haversineMeters(info.lat, info.lon, s.lat, s.lon);
+        const eta2  = formatETA(calcEtaSeconds(dist2, info.usedSpeedKmh));
+        m.setPopupContent(
+          `<b>🚏 ${s.name}</b><br>Llegada Bus: <b>${eta2}</b><br>Distancia Bus: <b>${formatDist(dist2)}</b><br>Velocidad Bus: <b>${info.usedSpeedKmh.toFixed(1)} km/h</b>`
+        );
+      }
+    }
+  }
+
+  if(busMarker.isPopupOpen()){
+    busMarker.setPopupContent(buildBusPopupHtml(info.rawSpeedKmh, busIsMoving));
+  }
+}, FORCE_DRAW_MS);
+
+</script>
+</body>
+</html>
