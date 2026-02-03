@@ -1,0 +1,438 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <time.h>
+#include <TinyGPSPlus.h>
+#include <HardwareSerial.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ---------------- WIFI ----------------
+#define WIFI_SSID     "Malware"
+#define WIFI_PASSWORD "1001769304"
+
+// ---------------- FIREBASE ----------------
+#define API_KEY       "AIzaSyB1PlndJO4Ntcx-1kBF0_9civhqmw6RW6o"
+#define DATABASE_URL  "https://gpsdb-f5976-default-rtdb.firebaseio.com/"
+
+// ---------------- GPS (NEO-6M) ----------------
+static const int GPS_RX_PIN = 16;  // ESP32 RX2 (GPS TX)
+//static const int GPS_TX_PIN = 17;  // ESP32 TX2 (GPS RX) Opcional
+static const uint32_t GPS_BAUD = 9600;
+
+TinyGPSPlus gps;
+HardwareSerial GPS_Serial(2);
+
+// ---------------- NTP Ecuador (UTC-5) ----------------
+const long  gmtOffset_sec = -5 * 3600;
+const int   daylightOffset_sec = 0;
+
+// ---------------- Firebase objects ----------------
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// ---------------- Timing ----------------
+unsigned long lastSend = 0;
+const unsigned long SEND_INTERVAL_MS = 3000;
+
+// ---------------- Anti-rebote (solo para saltos absurdos) ----------------
+bool hasLastAccepted = false;
+double lastLat = 0.0, lastLon = 0.0;
+unsigned long lastAcceptedMs = 0;
+
+// Parámetros (ajustables)
+const double MAX_SPEED_KMH_FOR_SANITY = 90.0;   // velocidad máxima razonable (bus urbano)
+const double EXTRA_MARGIN = 1.65;               // un poco más estricto
+const double MIN_ABS_JUMP_M = 80.0;             // más estricto
+const double HARD_MAX_JUMP_M = 600.0;           // más estricto
+
+// ---------------- Mejora de precisión (calidad + suavizado) ----------------
+const int    MIN_SATS_FOR_GOOD_FIX = 6;
+const double MAX_HDOP_FOR_GOOD_FIX = 2.0;
+
+// Suavizado base
+const double EMA_ALPHA_BAD  = 0.22;          // estable cuando empeora
+
+// Suavizado adaptativo según velocidad (cuando el fix es bueno)
+const double EMA_ALPHA_STOP = 0.35;          // casi detenido: reduce “bailes” (más estable)
+const double EMA_ALPHA_SLOW = 0.55;          // 2–15 km/h
+const double EMA_ALPHA_CITY = 0.72;          // 15–60 km/h (urbano típico)
+const double EMA_ALPHA_FAST = 0.82;          // >60 km/h (más reactivo)
+
+// Control de “casi detenido”
+const double STOP_SPEED_KMH = 2.0;           // por debajo, se considera detenido
+const double STOP_MIN_JUMP_M = 6.0;          // si está “detenido”, cualquier salto > 6m se suaviza fuerte
+
+bool hasFiltered = false;
+double fLat = 0.0, fLon = 0.0;
+
+// Distancia Haversine (metros)
+double haversineMeters(double lat1, double lon1, double lat2, double lon2) {
+  const double R = 6371000.0;
+  const double toRad = 0.017453292519943295; // PI/180
+  double dLat = (lat2 - lat1) * toRad;
+  double dLon = (lon2 - lon1) * toRad;
+
+  double a = sin(dLat / 2) * sin(dLat / 2) +
+             cos(lat1 * toRad) * cos(lat2 * toRad) *
+             sin(dLon / 2) * sin(dLon / 2);
+
+  double c = 2.0 * atan2(sqrt(a), sqrt(1.0 - a));
+  return R * c;
+}
+
+// ---------------- Helpers ----------------
+String getEcuadorTimeString() {
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) {
+    char buffer[30];
+    strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    return String(buffer);
+  }
+  return "NTP_NO_TIME";
+}
+
+void connectWiFi(uint32_t timeoutMs = 20000) {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  Serial.print("Conectando a WiFi");
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
+    Serial.print(".");
+    delay(300);
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("✅ WiFi conectado. IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("⚠️ No se pudo conectar a WiFi (timeout). Seguirá sin WiFi.");
+  }
+}
+
+void setupNTP() {
+  configTime(gmtOffset_sec, daylightOffset_sec, "pool.ntp.org", "time.nist.gov", "time.google.com");
+  Serial.println("⏱️ NTP configurado para Ecuador (UTC-5).");
+}
+
+void setupFirebase() {
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  config.token_status_callback = tokenStatusCallback;
+
+  Firebase.reconnectWiFi(true);
+  fbdo.setResponseSize(4096);
+
+  Serial.println("🔥 Iniciando Firebase...");
+
+  if (Firebase.signUp(&config, &auth, "", "")) {
+    Serial.println("✅ SignUp anónimo OK.");
+  } else {
+    Serial.print("❌ SignUp falló: ");
+    Serial.println(config.signer.signupError.message.c_str());
+  }
+
+  Firebase.begin(&config, &auth);
+}
+
+bool firebaseReady() {
+  return Firebase.ready();
+}
+
+// ----------------- Calidad y filtro -----------------
+bool isGoodFix(bool validLoc, int sats, double hdop) {
+  if (!validLoc) return false;
+  if (sats < 0 || hdop < 0) return false;
+  return (sats >= MIN_SATS_FOR_GOOD_FIX && hdop <= MAX_HDOP_FOR_GOOD_FIX);
+}
+
+void applyEMA(double lat, double lon, double alpha) {
+  if (!hasFiltered) {
+    fLat = lat; fLon = lon;
+    hasFiltered = true;
+    return;
+  }
+  fLat = alpha * lat + (1.0 - alpha) * fLat;
+  fLon = alpha * lon + (1.0 - alpha) * fLon;
+}
+
+// ✅ NUEVO: alpha adaptativo para “vida real” según velocidad
+double getAdaptiveAlpha(bool goodFix, double speedKmh, double jumpM) {
+  if (!goodFix) return EMA_ALPHA_BAD;
+
+  // Si no hay velocidad válida, asume urbano
+  if (speedKmh < 0) speedKmh = 25.0;
+
+  // Caso detenido: evita “baile” en semáforo/parado
+  if (speedKmh <= STOP_SPEED_KMH) {
+    // si estando “detenido” el GPS brinca más de X metros, suaviza aún más
+    if (jumpM > STOP_MIN_JUMP_M) return 0.20;
+    return EMA_ALPHA_STOP;
+  }
+
+  if (speedKmh <= 15.0) return EMA_ALPHA_SLOW;
+  if (speedKmh <= 60.0) return EMA_ALPHA_CITY;
+  return EMA_ALPHA_FAST;
+}
+
+// =====================================================
+//   CONFIGURACIÓN u-blox (NEO-6M) PARA MAYOR PRECISIÓN
+// - 5 Hz (200 ms)
+// - Dynamic model: Automotive
+// - SBAS ON
+// - Solo NMEA GGA + RMC para no saturar 9600 bps a 5 Hz
+// =====================================================
+void ubxChecksum(const uint8_t* payload, uint16_t len, uint8_t &ckA, uint8_t &ckB) {
+  ckA = 0; ckB = 0;
+  for (uint16_t i = 0; i < len; i++) {
+    ckA = ckA + payload[i];
+    ckB = ckB + ckA;
+  }
+}
+
+void sendUBX(const uint8_t* msg, uint16_t len) {
+  uint8_t ckA, ckB;
+  ubxChecksum(msg, len, ckA, ckB);
+
+  GPS_Serial.write(0xB5);
+  GPS_Serial.write(0x62);
+  GPS_Serial.write(msg, len);
+  GPS_Serial.write(ckA);
+  GPS_Serial.write(ckB);
+  GPS_Serial.flush();
+  delay(120);
+}
+
+void setNMEAMessageRate(uint8_t nmeaMsgId, uint8_t rateEveryCycle) {
+  uint8_t msg[] = { 0x06, 0x01, 0x03, 0x00, 0xF0, nmeaMsgId, rateEveryCycle };
+  sendUBX(msg, sizeof(msg));
+}
+
+void setupUbloxHighPrecision() {
+  Serial.println("🛰️ Configurando u-blox NEO-6M (5Hz + Automotive + SBAS + solo GGA/RMC)...");
+
+  // 1) CFG-RATE: 200 ms => 5 Hz
+  uint8_t rate5Hz[] = { 0x06, 0x08, 0x06, 0x00, 0xC8, 0x00, 0x01, 0x00, 0x01, 0x00 };
+  sendUBX(rate5Hz, sizeof(rate5Hz));
+
+  // 2) CFG-NAV5: Automotive (4), FixMode Auto (3)
+  uint8_t nav5[] = {
+    0x06, 0x24, 0x24, 0x00,
+    0x03, 0x00,
+    0x04,
+    0x03,
+    0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,
+    0x05,
+    0x00,
+    0xFA, 0x00,
+    0xFA, 0x00,
+    0x64, 0x00,
+    0x2C, 0x01,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00, 0x00,
+    0x00, 0x00,
+    0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00
+  };
+  sendUBX(nav5, sizeof(nav5));
+
+  // 3) CFG-SBAS: habilitar SBAS
+  uint8_t sbas[] = { 0x06, 0x16, 0x08, 0x00, 0x01, 0x03, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00 };
+  sendUBX(sbas, sizeof(sbas));
+
+  // 4) Solo GGA y RMC
+  setNMEAMessageRate(0x00, 1); // GGA ON
+  setNMEAMessageRate(0x04, 1); // RMC ON
+
+  setNMEAMessageRate(0x01, 0); // GLL OFF
+  setNMEAMessageRate(0x02, 0); // GSA OFF
+  setNMEAMessageRate(0x03, 0); // GSV OFF
+  setNMEAMessageRate(0x05, 0); // VTG OFF
+
+  Serial.println("✅ u-blox configurado: 5Hz + Automotive + SBAS + solo GGA/RMC.");
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  Serial.println("\n=== ESP32 + NEO-6M (u-blox) + Firebase (cada 3s) + Anti-saltos ===");
+
+  GPS_Serial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  Serial.println("📡 GPS en Serial2 iniciado (9600 bps).");
+
+  setupUbloxHighPrecision();
+
+  connectWiFi();
+  setupNTP();
+  setupFirebase();
+}
+
+void loop() {
+  while (GPS_Serial.available()) {
+    gps.encode(GPS_Serial.read());
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    static unsigned long lastWiFiTry = 0;
+    if (millis() - lastWiFiTry > 5000) {
+      lastWiFiTry = millis();
+      Serial.println("⚠️ WiFi caído. Reintentando...");
+      connectWiFi(8000);
+    }
+  }
+
+  // ✅ Envío FORZADO cada 3s SIEMPRE (sin drift)
+  if (millis() - lastSend >= SEND_INTERVAL_MS) {
+    lastSend += SEND_INTERVAL_MS;
+
+    String ecTime = getEcuadorTimeString();
+
+    bool validLoc = gps.location.isValid();
+    double lat = validLoc ? gps.location.lat() : 0.0;
+    double lon = validLoc ? gps.location.lng() : 0.0;
+
+    int sats = gps.satellites.isValid() ? gps.satellites.value() : -1;
+    double hdop = gps.hdop.isValid() ? gps.hdop.hdop() : -1;
+
+    double speedKmh = gps.speed.isValid() ? gps.speed.kmph() : -1;
+    double courseDeg = gps.course.isValid() ? gps.course.deg() : -1;
+    double altM = gps.altitude.isValid() ? gps.altitude.meters() : -9999;
+
+    bool goodFix = isGoodFix(validLoc, sats, hdop);
+
+    Serial.println("--------------------------------------------------");
+    Serial.print("Hora Ecuador: ");
+    Serial.println(ecTime);
+
+    Serial.print("Fix: ");
+    Serial.print(validLoc ? "✅" : "❌");
+    Serial.print(" | GoodFix: ");
+    Serial.print(goodFix ? "✅" : "❌");
+
+    Serial.print(" | Lat: ");
+    Serial.print(lat, 6);
+    Serial.print(" | Lon: ");
+    Serial.print(lon, 6);
+
+    Serial.print(" | Sats: ");
+    Serial.print(sats);
+    Serial.print(" | HDOP: ");
+    Serial.print(hdop);
+
+    Serial.print(" | Vel(km/h): ");
+    Serial.print(speedKmh);
+    Serial.print(" | Rumbo(deg): ");
+    Serial.print(courseDeg);
+    Serial.print(" | Alt(m): ");
+    Serial.println(altM);
+
+    // ----------------- ✅ Anti-saltos -----------------
+    bool acceptPoint = true;
+    double jumpM = 0.0;
+
+    if (!validLoc || lat == 0.0 || lon == 0.0) {
+      acceptPoint = false;
+    } else if (!hasLastAccepted) {
+      acceptPoint = true;
+    } else {
+      unsigned long nowMs = millis();
+      double dtS = (nowMs - lastAcceptedMs) / 1000.0;
+      if (dtS < 0.5) dtS = SEND_INTERVAL_MS / 1000.0;
+
+      jumpM = haversineMeters(lastLat, lastLon, lat, lon);
+
+      double maxSpeedKmh = MAX_SPEED_KMH_FOR_SANITY;
+      if (gps.speed.isValid() && speedKmh > 0 && speedKmh < 140) {
+        maxSpeedKmh = max(maxSpeedKmh, speedKmh * 1.7);
+        if (maxSpeedKmh > 140) maxSpeedKmh = 140;
+      }
+
+      double allowedM = (maxSpeedKmh / 3.6) * dtS * EXTRA_MARGIN;
+
+      if (jumpM > HARD_MAX_JUMP_M) acceptPoint = false;
+      else if (jumpM > max(MIN_ABS_JUMP_M, allowedM)) acceptPoint = false;
+    }
+
+    if (!acceptPoint) {
+      Serial.print("⚠️ Punto ignorado por salto/rebote. Jump(m): ");
+      Serial.println(jumpM, 1);
+    }
+
+    // ----------------- Suavizado EMA ADAPTATIVO -----------------
+    double outLat = lat;
+    double outLon = lon;
+
+    if (acceptPoint) {
+      double alpha = getAdaptiveAlpha(goodFix, speedKmh, jumpM);
+      applyEMA(lat, lon, alpha);
+      outLat = hasFiltered ? fLat : lat;
+      outLon = hasFiltered ? fLon : lon;
+    }
+
+    // -------- Firebase (FORZADO cada 3s) --------
+    if (WiFi.status() == WL_CONNECTED && firebaseReady()) {
+      FirebaseJson json;
+      json.set("hora_ecuador", ecTime);
+
+      json.set("fix", validLoc);
+      json.set("good_fix", goodFix);
+      json.set("accept_point", acceptPoint);
+
+      // alpha usado (útil para diagnóstico)
+      double usedAlpha = acceptPoint ? getAdaptiveAlpha(goodFix, speedKmh, jumpM) : -1.0;
+      json.set("ema_alpha", usedAlpha);
+
+      if (!acceptPoint && hasFiltered) {
+        json.set("lat", fLat);
+        json.set("lon", fLon);
+      } else {
+        json.set("lat", outLat);
+        json.set("lon", outLon);
+      }
+
+      // crudos para diagnóstico
+      json.set("raw_lat", lat);
+      json.set("raw_lon", lon);
+      json.set("jump_m", jumpM);
+
+      json.set("satelites", sats);
+      json.set("hdop", hdop);
+
+      json.set("speed_kmh", speedKmh);
+      json.set("course_deg", courseDeg);
+      json.set("alt_m", altM);
+
+      json.set("ts_ms", (int)millis());
+
+      if (Firebase.RTDB.setJSON(&fbdo, "/NodoMovil", &json)) {
+        Serial.println("✅ Enviado a Firebase (Forzado cada 3s).");
+        if (acceptPoint) {
+          hasLastAccepted = true;
+          lastLat = lat;
+          lastLon = lon;
+          lastAcceptedMs = millis();
+        }
+      } else {
+        Serial.print("❌ Error Firebase: ");
+        Serial.println(fbdo.errorReason());
+      }
+    } else {
+      Serial.println("⚠️ Sin WiFi o Firebase no listo; no se envió.");
+
+      if (acceptPoint) {
+        hasLastAccepted = true;
+        lastLat = lat;
+        lastLon = lon;
+        lastAcceptedMs = millis();
+      }
+    }
+  }
+}
