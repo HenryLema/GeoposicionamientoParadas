@@ -1,0 +1,469 @@
+#include <WiFi.h>
+#include <time.h>
+#include <math.h>
+
+#include <TinyGPSPlus.h>
+#include <HardwareSerial.h>
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ---------------- WIFI ----------------
+#define WIFI_SSID     "Malware"
+#define WIFI_PASSWORD "1001769304"
+
+// ---------------- FIREBASE ----------------
+#define API_KEY       "AIzaSyB1PlndJO4Ntcx-1kBF0_9civhqmw6RW6o"
+#define DATABASE_URL  "https://gpsdb-f5976-default-rtdb.firebaseio.com/"
+
+// ✅ ESTE ESP32 ES EL NODO FIJO (SE ESCRIBE EN /NodoFijo)
+const char* FIXED_PATH = "/NodoFijo";
+
+// ---------------- GPS (NEO-6M) ----------------
+static const int GPS_RX_PIN = 16;  // ESP32 RX2 (GPS TX)
+static const int GPS_TX_PIN = 17;  // ESP32 TX2 (GPS RX) opcional
+static const uint32_t GPS_BAUD = 9600;
+
+TinyGPSPlus gps;
+HardwareSerial GPS_Serial(2);
+
+// ---------------- NTP Ecuador (UTC-5) ----------------
+const long  gmtOffset_sec = -5 * 3600;
+const int   daylightOffset_sec = 0;
+
+// ---------------- Firebase objects ----------------
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// ---------------- Timing ----------------
+unsigned long lastSend = 0;
+const unsigned long SEND_INTERVAL_MS = 3000;
+
+// ✅ NUEVO: evita “congelado” por dato GPS viejo
+const unsigned long MAX_GPS_AGE_MS = 4000;
+
+// ---------------- OLED SSD1306 ----------------
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+#define OLED_ADDR     0x3C
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ---------------- BUS (lectura desde Firebase) ----------------
+double busLat = 0.0, busLon = 0.0;
+double busSpeedKmh = 0.0;
+bool busFix = false;
+
+// ETA/Distancia calculadas
+double distBusM = -1;
+long etaBusSec = -1;
+
+// Ajustes ETA similares a la web
+const double ROUTE_FACTOR = 1.45;
+const int ETA_BIAS_SEC = 45;
+const double DEFAULT_SPEED_KMH = 10.0;
+const double MIN_USABLE_SPEED_KMH = 3.0;
+const double MAX_REASONABLE_SPEED_KMH = 55.0;
+
+// ===================================================
+// ✅ MEJORAS PARA NODO FIJO (ANTI "SALTO" GPS)
+// ===================================================
+const double HDOP_MAX_ACCEPT   = 3.0;
+const int    SATS_MIN_ACCEPT   = 6;
+const double MAX_JUMP_ALLOW_M  = 25.0;
+const double STILL_RADIUS_M    = 8.0;
+const double EMA_ALPHA         = 0.20;
+
+// Estado del filtro
+bool   filtInit = false;
+double latFilt = 0.0, lonFilt = 0.0;
+double latLastSent = 0.0, lonLastSent = 0.0;
+
+// ✅ NUEVO: última posición buena (para seguir publicando aunque el fix se ponga malo)
+bool   hasLastGood = false;
+double lastGoodLat = 0.0, lastGoodLon = 0.0;
+
+// ---------------- Helpers ----------------
+String getEcuadorTimeString() {
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) {
+    char buffer[30];
+    strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    return String(buffer);
+  }
+  return "NTP_NO_TIME";
+}
+
+double haversineMeters(double lat1, double lon1, double lat2, double lon2) {
+  const double R = 6371000.0;
+  auto toRad = [](double x){ return x * M_PI / 180.0; };
+
+  double dLat = toRad(lat2 - lat1);
+  double dLon = toRad(lon2 - lon1);
+
+  double a = sin(dLat/2)*sin(dLat/2) +
+             cos(toRad(lat1)) * cos(toRad(lat2)) * sin(dLon/2)*sin(dLon/2);
+
+  return 2.0 * R * asin(sqrt(a));
+}
+
+double clamp(double v, double lo, double hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+double pickSpeedKmh(double rawSpeedKmh) {
+  double s = rawSpeedKmh;
+  if (!isfinite(s) || s < 0) s = 0;
+  s = clamp(s, 0, MAX_REASONABLE_SPEED_KMH);
+
+  if (s >= MIN_USABLE_SPEED_KMH) return s;
+  return DEFAULT_SPEED_KMH;
+}
+
+long calcEtaSeconds(double distStraightM, double usedSpeedKmh) {
+  double distRoadM = distStraightM * ROUTE_FACTOR;
+  double speedMs = usedSpeedKmh / 3.6;
+  double etaMove = distRoadM / fmax(speedMs, 0.1);
+  return (long)(etaMove + ETA_BIAS_SEC);
+}
+
+bool isGoodFix(bool validLoc, double lat, double lon, int sats, double hdop) {
+  if (!validLoc) return false;
+  if (lat == 0.0 || lon == 0.0) return false;
+  if (sats < SATS_MIN_ACCEPT) return false;
+  if (hdop < 0) return false;
+  if (hdop > HDOP_MAX_ACCEPT) return false;
+  return true;
+}
+
+bool filterFixedPosition(double latIn, double lonIn, double &latOut, double &lonOut) {
+  if (!filtInit) {
+    latFilt = latIn;
+    lonFilt = lonIn;
+    latLastSent = latIn;
+    lonLastSent = lonIn;
+    filtInit = true;
+    latOut = latFilt;
+    lonOut = lonFilt;
+    return true;
+  }
+
+  double jumpM = haversineMeters(latLastSent, lonLastSent, latIn, lonIn);
+
+  if (jumpM > MAX_JUMP_ALLOW_M) {
+    latOut = latFilt;
+    lonOut = lonFilt;
+    return true;
+  }
+
+  if (jumpM < STILL_RADIUS_M) {
+    latOut = latFilt;
+    lonOut = lonFilt;
+    return true;
+  }
+
+  latFilt = (EMA_ALPHA * latIn) + ((1.0 - EMA_ALPHA) * latFilt);
+  lonFilt = (EMA_ALPHA * lonIn) + ((1.0 - EMA_ALPHA) * lonFilt);
+
+  latLastSent = latFilt;
+  lonLastSent = lonFilt;
+
+  latOut = latFilt;
+  lonOut = lonFilt;
+  return true;
+}
+
+void oledPrintBoot() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(31, 0);
+  display.println("Red Otavalo");
+  display.println("---------------------");
+  display.println("Iniciando...");
+  display.display();
+}
+
+void oledShowData(bool fix, int sats, double hdop, const String& hora) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(35, 0);
+  display.println("Nodo Fijo");
+
+  display.setCursor(0, 10);
+  display.print("Hora: ");
+  display.println(hora.substring(11));
+
+  display.setCursor(0, 20);
+  display.print("Fix: ");
+  display.print(fix ? "Si" : "No");
+  display.print(" Sats: ");
+  display.print(sats >= 0 ? sats : 0);
+
+  display.setCursor(0, 30);
+  display.print("Precision: ");
+  if (hdop >= 0) display.print(hdop, 1);
+  else display.print("--");
+
+  display.setCursor(0, 40);
+  display.print("Distancia Bus: ");
+  if (distBusM >= 0) {
+    if (distBusM < 1000) {
+      display.print((int)round(distBusM));
+      display.print("m");
+    } else {
+      display.print(distBusM / 1000.0, 2);
+      display.print("km");
+    }
+  } else {
+    display.print("--");
+  }
+
+  display.setCursor(0, 52);
+  display.print("LLegada Bus: ");
+  if (etaBusSec > 0) {
+    int totalMin = (etaBusSec + 30) / 60;
+    if (totalMin < 1) display.print("<1m");
+    else if (totalMin < 60) { display.print(totalMin); display.print("min"); }
+    else {
+      int h = totalMin / 60;
+      int m = totalMin % 60;
+      display.print(h); display.print("h ");
+      display.print(m); display.print("m");
+    }
+  } else {
+    display.print("--");
+  }
+
+  display.display();
+}
+
+void connectWiFi(uint32_t timeoutMs = 20000) {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  Serial.print("📶 Conectando a WiFi");
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
+    Serial.print(".");
+    delay(300);
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("✅ WiFi conectado. IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("⚠️ No se pudo conectar a WiFi (timeout). Seguirá sin WiFi.");
+  }
+}
+
+void setupNTP() {
+  configTime(gmtOffset_sec, daylightOffset_sec, "pool.ntp.org", "time.nist.gov", "time.google.com");
+  Serial.println("⏱️  NTP configurado para Ecuador (UTC-5).");
+}
+
+void setupFirebase() {
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  config.token_status_callback = tokenStatusCallback;
+
+  Firebase.reconnectWiFi(true);
+  fbdo.setResponseSize(4096);
+
+  Serial.println("🔥 Iniciando Firebase...");
+
+  if (Firebase.signUp(&config, &auth, "", "")) {
+    Serial.println("✅ SignUp Anónimo OK.");
+  } else {
+    Serial.print("❌ SignUp Falló: ");
+    Serial.println(config.signer.signupError.message.c_str());
+  }
+
+  Firebase.begin(&config, &auth);
+}
+
+bool firebaseReady() {
+  return Firebase.ready();
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  Serial.println("\n=== ESP32 + NEO-6M + Firebase + OLED-SSD1306 ===");
+  Serial.print("📌 Enviando a la ruta: ");
+  Serial.println(FIXED_PATH);
+
+  GPS_Serial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  Serial.println("📡 GPS en Serial2 iniciado (9600 bps).");
+
+  Wire.begin();
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("❌ No se detecto OLED SSD1306 (0x3C). Revisa cables/SDA/SCL.");
+  } else {
+    oledPrintBoot();
+  }
+
+  connectWiFi();
+  setupNTP();
+  setupFirebase();
+}
+
+void loop() {
+  while (GPS_Serial.available()) {
+    gps.encode(GPS_Serial.read());
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    static unsigned long lastWiFiTry = 0;
+    if (millis() - lastWiFiTry > 5000) {
+      lastWiFiTry = millis();
+      Serial.println("⚠️ WiFi caído. Reintentando...");
+      connectWiFi(8000);
+    }
+  }
+
+  if (millis() - lastSend >= SEND_INTERVAL_MS) {
+    lastSend = millis();
+
+    String ecTime = getEcuadorTimeString();
+
+    bool validLoc = gps.location.isValid();
+    double latRaw = validLoc ? gps.location.lat() : 0.0;
+    double lonRaw = validLoc ? gps.location.lng() : 0.0;
+
+    int sats  = gps.satellites.isValid() ? (int)gps.satellites.value() : -1;
+    double hdop = gps.hdop.isValid() ? gps.hdop.hdop() : -1;
+    double altM = gps.altitude.isValid() ? gps.altitude.meters() : -9999;
+
+    // ✅ NUEVO: edad del dato GPS (evita usar datos “pegados”/viejos)
+    unsigned long ageMs = validLoc ? gps.location.age() : 999999;
+    bool fresh = (ageMs <= MAX_GPS_AGE_MS);
+
+    // ✅ “good” ahora exige dato reciente
+    bool good = fresh && isGoodFix(validLoc, latRaw, lonRaw, sats, hdop);
+
+    // Procesar bus (igual que antes)
+    distBusM = -1;
+    etaBusSec = -1;
+
+    if (WiFi.status() == WL_CONNECTED && firebaseReady()) {
+      if (Firebase.RTDB.getJSON(&fbdo, "/NodoMovil")) {
+        FirebaseJson *j = fbdo.jsonObjectPtr();
+        FirebaseJsonData jd;
+
+        if (j->get(jd, "fix")) busFix = jd.to<bool>(); else busFix = true;
+        if (j->get(jd, "lat")) busLat = jd.to<double>();
+        if (j->get(jd, "lon")) busLon = jd.to<double>();
+        if (j->get(jd, "speed_kmh")) busSpeedKmh = jd.to<double>(); else busSpeedKmh = 0.0;
+      }
+    }
+
+    double lat = 0.0, lon = 0.0;
+    if (good) {
+      filterFixedPosition(latRaw, lonRaw, lat, lon);
+      hasLastGood = true;
+      lastGoodLat = lat;
+      lastGoodLon = lon;
+
+      if (busFix && busLat != 0.0 && busLon != 0.0) {
+        distBusM = haversineMeters(lat, lon, busLat, busLon);
+        double usedSpeed = pickSpeedKmh(busSpeedKmh);
+        etaBusSec = calcEtaSeconds(distBusM, usedSpeed);
+      }
+    } else {
+      // si no hay good, para OLED usamos la última buena si existe
+      if (hasLastGood) { lat = lastGoodLat; lon = lastGoodLon; }
+    }
+
+    Serial.println("-------------------------------------------------------------------------------------------------------------------------------------");
+    Serial.print("Hora Ecuador: "); Serial.println(ecTime);
+    Serial.print("FixRaw: "); Serial.print(validLoc ? "✅" : "❌");
+    Serial.print(" | Age(ms): "); Serial.print(ageMs);
+    Serial.print(" | Fresh: "); Serial.print(fresh ? "✅" : "❌");
+    Serial.print(" | Sats: "); Serial.print(sats);
+    Serial.print(" | HDOP: "); Serial.print(hdop);
+
+    if (good) {
+      Serial.print(" | LatRaw: "); Serial.print(latRaw, 6);
+      Serial.print(" | LonRaw: "); Serial.print(lonRaw, 6);
+      Serial.print(" | LatFilt: "); Serial.print(lat, 6);
+      Serial.print(" | LonFilt: "); Serial.print(lon, 6);
+    } else {
+      Serial.print(" | Fix Bueno: ❌ (Se enviara estado igual)");
+    }
+    Serial.print(" | Alt(m): "); Serial.println(altM);
+
+    if (display.width() > 0) {
+      oledShowData(good, sats, hdop, ecTime);
+    }
+
+    // =========================================================
+    // ✅ CAMBIO CLAVE: SIEMPRE ENVIA CADA 3s (fix true o false)
+    // =========================================================
+    if (WiFi.status() == WL_CONNECTED && firebaseReady()) {
+      FirebaseJson json;
+
+      json.set("hora_ecuador", ecTime);
+      json.set("ts_ms", (int)millis());
+
+      json.set("gps_valid", validLoc);
+      json.set("gps_age_ms", (int)ageMs);
+      json.set("satelites", sats);
+      json.set("hdop", hdop);
+      json.set("alt_m", altM);
+
+      if (good && lat != 0.0 && lon != 0.0) {
+        json.set("fix", true);
+        json.set("lat", lat);
+        json.set("lon", lon);
+      } else {
+        json.set("fix", false);
+
+        // publica última buena si existe (para que el mapa no se vaya a 0)
+        if (hasLastGood) {
+          json.set("lat", lastGoodLat);
+          json.set("lon", lastGoodLon);
+        } else {
+          json.set("lat", 0.0);
+          json.set("lon", 0.0);
+        }
+
+        if (!validLoc) json.set("reason", "NO_VALID_LOC");
+        else if (!fresh) json.set("reason", "GPS_STALE");
+        else if (sats < SATS_MIN_ACCEPT) json.set("reason", "LOW_SATS");
+        else if (hdop < 0) json.set("reason", "NO_HDOP");
+        else if (hdop > HDOP_MAX_ACCEPT) json.set("reason", "HIGH_HDOP");
+        else json.set("reason", "FILTERED");
+      }
+
+      if (distBusM >= 0) {
+        json.set("bus_dist_m", distBusM);
+        json.set("bus_eta_s", (int)etaBusSec);
+        json.set("bus_speed_kmh", busSpeedKmh);
+      }
+
+      if (Firebase.RTDB.setJSON(&fbdo, FIXED_PATH, &json)) {
+        Serial.println("✅ Estado enviado a Firebase (/NodoFijo) cada 3s.");
+      } else {
+        Serial.print("❌ Error Firebase: ");
+        Serial.println(fbdo.errorReason());
+      }
+    } else {
+      if (WiFi.status() != WL_CONNECTED) Serial.println("⚠️ Sin WiFi; no se envio.");
+      else Serial.println("⚠️ Firebase no listo, no se envio.");
+    }
+  }
+}
